@@ -26,3 +26,7 @@ To apply the renderer patches required for the standalone sandbox escape, do
 
 `pwn.py` is the web server that serves the exploit. Run it on Linux (or WSL) and start
 Chrome in guest mode, then browse to `http://localhost:8000/`
+
+## License
+
+This code is released under a BSD license specified in the file [`LICENSE`](https://github.com/niklasb/hack2win-chrome/blob/master/LICENSE)
